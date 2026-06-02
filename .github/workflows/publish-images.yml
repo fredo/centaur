@@ -58,6 +58,10 @@ jobs:
             image: centaur-slackbotv2
             dockerfile: services/slackbotv2/Dockerfile
             target: ""
+          - service: web
+            image: centaur-web
+            dockerfile: services/web/Dockerfile
+            target: ""
           - service: agent
             image: centaur-agent
             dockerfile: services/sandbox/Dockerfile
