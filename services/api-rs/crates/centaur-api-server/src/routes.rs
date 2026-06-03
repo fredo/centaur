@@ -2,7 +2,8 @@ use std::{
     collections::BTreeMap,
     convert::Infallible,
     convert::TryFrom,
-    env,
+    env, fs,
+    path::{Path as FsPath, PathBuf},
     time::{Duration, Instant},
 };
 
@@ -42,9 +43,10 @@ use crate::{
     ApiError,
     types::{
         AppendMessagesRequest, AppendMessagesResponse, CreateFeedbackRequest,
-        CreateFeedbackResponse, CreateSessionRequest, EmitWorkflowEventRequest, EventsQuery,
-        ExecuteSessionRequest, ExecuteSessionResponse, ListWorkflowRunsQuery, SessionSseEvent,
-        stream_error_sse,
+        CreateFeedbackResponse, CreateSessionRequest, EmitWorkflowEventRequest, EventLogQuery,
+        EventsQuery, ExecuteSessionRequest, ExecuteSessionResponse, ListEventsResponse,
+        ListMessagesResponse, ListPersonasResponse, ListWorkflowRunsQuery, PersonaRecord,
+        SessionSseEvent, SetSessionTitleRequest, SetSessionTitleResponse, stream_error_sse,
     },
 };
 
@@ -86,16 +88,24 @@ pub fn build_router_with_session_and_workflow_runtime(
     Router::new()
         .route("/healthz", get(healthz))
         .route("/metrics", get(metrics))
-        .route("/api/session/{thread_key}", post(create_or_get_session))
+        .route("/api/personas", get(list_personas))
+        .route(
+            "/api/session/{thread_key}",
+            get(get_session).post(create_or_get_session),
+        )
         .route(
             "/api/session/{thread_key}/messages",
-            post(append_messages).layer(DefaultBodyLimit::max(MAX_SESSION_JSON_BODY_BYTES)),
+            get(list_messages)
+                .post(append_messages)
+                .layer(DefaultBodyLimit::max(MAX_SESSION_JSON_BODY_BYTES)),
         )
         .route(
             "/api/session/{thread_key}/execute",
             post(execute_session).layer(DefaultBodyLimit::max(MAX_SESSION_JSON_BODY_BYTES)),
         )
+        .route("/api/session/{thread_key}/event-log", get(list_events))
         .route("/api/session/{thread_key}/events", get(stream_events))
+        .route("/api/session/{thread_key}/title", post(set_session_title))
         .route("/api/feedback", post(create_feedback))
         .route("/api/sandboxes/drain", post(drain_sandboxes))
         .route(
@@ -209,6 +219,28 @@ async fn create_or_get_session(
     Ok(Json(session))
 }
 
+async fn get_session(
+    State(state): State<AppState>,
+    Path(raw_thread_key): Path<String>,
+) -> Result<Json<Session>, ApiError> {
+    let thread_key = ThreadKey::try_from(raw_thread_key)?;
+    let session = state.runtime.get_session(&thread_key).await?;
+    Ok(Json(session))
+}
+
+async fn list_personas() -> Json<ListPersonasResponse> {
+    Json(discover_personas())
+}
+
+async fn list_messages(
+    State(state): State<AppState>,
+    Path(raw_thread_key): Path<String>,
+) -> Result<Json<ListMessagesResponse>, ApiError> {
+    let thread_key = ThreadKey::try_from(raw_thread_key)?;
+    let messages = state.runtime.list_messages(&thread_key).await?;
+    Ok(Json(ListMessagesResponse { messages }))
+}
+
 async fn append_messages(
     State(state): State<AppState>,
     Path(raw_thread_key): Path<String>,
@@ -250,6 +282,33 @@ async fn execute_session(
         thread_key: execution.thread_key,
         status: execution.status.to_string(),
     }))
+}
+
+async fn set_session_title(
+    State(state): State<AppState>,
+    Path(raw_thread_key): Path<String>,
+    Json(request): Json<SetSessionTitleRequest>,
+) -> Result<Json<SetSessionTitleResponse>, ApiError> {
+    let thread_key = ThreadKey::try_from(raw_thread_key)?;
+    let event = state
+        .runtime
+        .append_thread_title_update(&thread_key, &request.title, request.metadata)
+        .await?;
+    Ok(Json(SetSessionTitleResponse { ok: true, event }))
+}
+
+async fn list_events(
+    State(state): State<AppState>,
+    Path(raw_thread_key): Path<String>,
+    Query(query): Query<EventLogQuery>,
+) -> Result<Json<ListEventsResponse>, ApiError> {
+    let thread_key = ThreadKey::try_from(raw_thread_key)?;
+    let limit = query.limit.unwrap_or(500).clamp(1, 2_000);
+    let events = state
+        .runtime
+        .list_events_after(&thread_key, query.after_event_id.unwrap_or(0), limit)
+        .await?;
+    Ok(Json(ListEventsResponse { events }))
 }
 
 async fn drain_sandboxes(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
@@ -722,6 +781,97 @@ fn header_value(headers: &HeaderMap, name: &str) -> Option<String> {
         .get(name)
         .and_then(|value| value.to_str().ok())
         .map(ToOwned::to_owned)
+}
+
+fn discover_personas() -> ListPersonasResponse {
+    let mut personas = BTreeMap::new();
+    for root in persona_roots() {
+        collect_personas(&root, &mut personas);
+    }
+    personas
+}
+
+fn persona_roots() -> Vec<PathBuf> {
+    if let Ok(root) = std::env::var("CENTAUR_PERSONAS_ROOT") {
+        return vec![PathBuf::from(root)];
+    }
+    vec![PathBuf::from("tools"), PathBuf::from("/app/tools")]
+}
+
+fn collect_personas(root: &FsPath, personas: &mut ListPersonasResponse) {
+    let Ok(entries) = fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !is_visible_dir(&path) {
+            continue;
+        }
+        if path.join("pyproject.toml").exists() {
+            insert_persona(&path, personas);
+            continue;
+        }
+        let Ok(children) = fs::read_dir(path) else {
+            continue;
+        };
+        for child in children.flatten() {
+            let candidate = child.path();
+            if is_visible_dir(&candidate) && candidate.join("pyproject.toml").exists() {
+                insert_persona(&candidate, personas);
+            }
+        }
+    }
+}
+
+fn insert_persona(path: &FsPath, personas: &mut ListPersonasResponse) {
+    let Some((name, persona)) = load_persona(path) else {
+        return;
+    };
+    personas.insert(name, persona);
+}
+
+fn load_persona(path: &FsPath) -> Option<(String, PersonaRecord)> {
+    let pyproject = fs::read_to_string(path.join("pyproject.toml")).ok()?;
+    let pyproject: toml::Value = pyproject.parse().ok()?;
+    let project = pyproject.get("project");
+    let centaur = pyproject.get("tool")?.get("centaur")?;
+    if centaur.get("type")?.as_str()? != "persona" {
+        return None;
+    }
+    let name = path.file_name()?.to_str()?.to_owned();
+    let description = project
+        .and_then(|value| value.get("description"))
+        .and_then(toml::Value::as_str)
+        .unwrap_or("")
+        .to_owned();
+    let engine = centaur
+        .get("engine")
+        .and_then(toml::Value::as_str)
+        .unwrap_or("amp")
+        .to_owned();
+    let default_repo = centaur
+        .get("default_repo")
+        .and_then(toml::Value::as_str)
+        .map(ToOwned::to_owned);
+
+    Some((
+        name,
+        PersonaRecord {
+            description,
+            engine,
+            default_repo,
+            has_custom_executor: path.join("run.py").exists(),
+        },
+    ))
+}
+
+fn is_visible_dir(path: &FsPath) -> bool {
+    if !path.is_dir() {
+        return false;
+    }
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| !name.starts_with('.') && !name.starts_with('_'))
 }
 
 #[cfg(test)]
