@@ -19,8 +19,10 @@ use axum::{
     routing::{any, get, post},
 };
 use base64::{Engine as _, engine::general_purpose};
-use centaur_session_core::{Session, ThreadKey};
-use centaur_session_runtime::{ExecuteSessionInput, SandboxRuntime, SessionRuntime};
+use centaur_session_core::ThreadKey;
+use centaur_session_runtime::{
+    ExecuteSessionInput, HarnessConflictPolicy, SandboxRuntime, SessionRuntime,
+};
 use centaur_session_sqlx::CreateFeedbackInput;
 use centaur_session_sqlx::PgSessionStore;
 use centaur_telemetry::{
@@ -42,9 +44,9 @@ use crate::{
     ApiError,
     types::{
         AppendMessagesRequest, AppendMessagesResponse, CreateFeedbackRequest,
-        CreateFeedbackResponse, CreateSessionRequest, EmitWorkflowEventRequest, EventsQuery,
-        ExecuteSessionRequest, ExecuteSessionResponse, ListWorkflowRunsQuery, SessionSseEvent,
-        stream_error_sse,
+        CreateFeedbackResponse, CreateSessionRequest, CreateSessionResponse,
+        EmitWorkflowEventRequest, EventsQuery, ExecuteSessionRequest, ExecuteSessionResponse,
+        ListWorkflowRunsQuery, OnHarnessConflict, SessionSseEvent, stream_error_sse,
     },
 };
 
@@ -195,18 +197,26 @@ async fn create_or_get_session(
     State(state): State<AppState>,
     Path(raw_thread_key): Path<String>,
     Json(request): Json<CreateSessionRequest>,
-) -> Result<Json<Session>, ApiError> {
+) -> Result<Json<CreateSessionResponse>, ApiError> {
     let thread_key = ThreadKey::try_from(raw_thread_key)?;
-    let session = state
+    let on_harness_conflict = match request.on_harness_conflict {
+        Some(OnHarnessConflict::Restart) => HarnessConflictPolicy::Restart,
+        Some(OnHarnessConflict::Reject) | None => HarnessConflictPolicy::Reject,
+    };
+    let outcome = state
         .runtime
         .create_or_get_session(
             &thread_key,
             &request.harness_type,
             request.persona_id.as_deref(),
             request.metadata,
+            on_harness_conflict,
         )
         .await?;
-    Ok(Json(session))
+    Ok(Json(CreateSessionResponse {
+        session: outcome.session,
+        harness_switched: outcome.harness_switched,
+    }))
 }
 
 async fn append_messages(
