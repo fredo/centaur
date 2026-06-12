@@ -40,6 +40,7 @@ use tracing::Span;
 
 use crate::{
     ApiError,
+    codemode_mcp::{CodeModeMcpConfig, nest_codemode_mcp},
     types::{
         AppendMessagesRequest, AppendMessagesResponse, CreateFeedbackRequest,
         CreateFeedbackResponse, CreateSessionRequest, EmitWorkflowEventRequest, EventsQuery,
@@ -81,9 +82,17 @@ pub fn build_router_with_session_and_workflow_runtime(
     runtime: SessionRuntime,
     workflows: Option<WorkflowRuntime>,
 ) -> Router {
+    build_router_with_session_and_workflow_and_codemode_runtime(runtime, workflows, None)
+}
+
+pub fn build_router_with_session_and_workflow_and_codemode_runtime(
+    runtime: SessionRuntime,
+    workflows: Option<WorkflowRuntime>,
+    codemode: Option<CodeModeMcpConfig>,
+) -> Router {
     let metrics_handle =
         prometheus_handle().expect("failed to initialize Prometheus metrics recorder");
-    Router::new()
+    let router = Router::new()
         .route("/healthz", get(healthz))
         .route("/metrics", get(metrics))
         .route("/api/session/{thread_key}", post(create_or_get_session))
@@ -150,7 +159,13 @@ pub fn build_router_with_session_and_workflow_runtime(
             runtime,
             metrics: metrics_handle,
             workflows,
-        })
+        });
+
+    if let Some(config) = codemode {
+        nest_codemode_mcp(router, config)
+    } else {
+        router
+    }
 }
 
 async fn healthz() -> Json<Value> {
